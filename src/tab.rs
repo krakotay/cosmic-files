@@ -2740,8 +2740,10 @@ pub enum HeadingOptions {
     Size,
     TrashedOn,
     FileType,
+    FileType,
 }
 
+///
 ///
 impl fmt::Display for HeadingOptions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -2750,6 +2752,7 @@ impl fmt::Display for HeadingOptions {
             Self::Modified => write!(f, "{}", fl!("modified")),
             Self::Size => write!(f, "{}", fl!("size")),
             Self::TrashedOn => write!(f, "{}", fl!("trashed-on")),
+            Self::FileType => write!(f, "{}", "FileType"),
             Self::FileType => write!(f, "{}", "FileType"),
         }
     }
@@ -2762,6 +2765,7 @@ impl HeadingOptions {
             Self::Modified.to_string(),
             Self::Size.to_string(),
             Self::TrashedOn.to_string(),
+            Self::FileType.to_string(),
             Self::FileType.to_string(),
         ]
     }
@@ -5377,6 +5381,8 @@ impl Tab {
         let size_width = 100.0;
         let type_width = 160.0;
         let condensed = size.width < (name_width + modified_width + size_width + type_width);
+        let type_width = 160.0;
+        let condensed = size.width < (name_width + modified_width + size_width + type_width);
 
         let (sort_name, sort_direction, _) = self.sort_options();
         let heading_item = |name, width, msg| {
@@ -5416,6 +5422,11 @@ impl Tab {
                 )
             },
             heading_item(fl!("size"), Length::Fixed(size_width), HeadingOptions::Size),
+            heading_item(
+                fl!("filetype"),
+                Length::Fixed(type_width),
+                HeadingOptions::FileType,
+            ),
             heading_item(
                 fl!("filetype"),
                 Length::Fixed(type_width),
@@ -6080,6 +6091,8 @@ impl Tab {
         let size_width = 100.0;
         let type_width = 160.0;
         let condensed = size.width < (name_width + modified_width + size_width + type_width);
+        let type_width = 160.0;
+        let condensed = size.width < (name_width + modified_width + size_width + type_width);
         let is_search = matches!(self.location, Location::Search(..));
         let icon_size = if condensed || is_search {
             icon_sizes.list_condensed()
@@ -6257,6 +6270,9 @@ impl Tab {
                             widget::text::body(type_text.clone())
                                 .width(Length::Fixed(type_width))
                                 .into(),
+                            widget::text::body(type_text.clone())
+                                .width(Length::Fixed(type_width))
+                                .into(),
                         ])
                         .height(Length::Fixed(f32::from(row_height)))
                         .align_y(Alignment::Center)
@@ -6275,6 +6291,9 @@ impl Tab {
                                 .into(),
                             widget::text::body(size_text.clone())
                                 .width(Length::Fixed(size_width))
+                                .into(),
+                            widget::text::body(type_text.clone())
+                                .width(Length::Fixed(type_width))
                                 .into(),
                             widget::text::body(type_text.clone())
                                 .width(Length::Fixed(type_width))
@@ -6375,6 +6394,9 @@ impl Tab {
                                 widget::text::body(type_text.clone())
                                     .width(Length::Fixed(type_width))
                                     .into(),
+                                widget::text::body(type_text.clone())
+                                    .width(Length::Fixed(type_width))
+                                    .into(),
                             ])
                             .align_y(Alignment::Center)
                             .spacing(space_xxs)
@@ -6393,6 +6415,9 @@ impl Tab {
                                     .into(),
                                 widget::text::body(size_text)
                                     .width(Length::Fixed(size_width))
+                                    .into(),
+                                widget::text::body(type_text.clone())
+                                    .width(Length::Fixed(type_width))
                                     .into(),
                                 widget::text::body(type_text.clone())
                                     .width(Length::Fixed(type_width))
