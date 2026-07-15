@@ -214,6 +214,7 @@ impl Config {
             military_time: self.tab.military_time,
             show_hidden: self.dialog.show_hidden,
             single_click: false,
+            use_binary_units: self.tab.use_binary_units,
             view: self.dialog.view,
         }
     }
@@ -339,6 +340,8 @@ pub struct TabConfig {
     pub show_hidden: bool,
     /// Single click to open
     pub single_click: bool,
+    /// Format file sizes using binary units such as KiB and MiB
+    pub use_binary_units: bool,
     /// Selected view, grid or list
     pub view: View,
 }
@@ -351,6 +354,7 @@ impl Default for TabConfig {
             military_time: false,
             show_hidden: false,
             single_click: false,
+            use_binary_units: true,
             view: View::List,
         }
     }
