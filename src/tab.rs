@@ -2583,7 +2583,6 @@ pub enum HeadingOptions {
     Size,
     TrashedOn,
     FileType,
-    FileType,
 }
 
 ///
