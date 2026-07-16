@@ -741,7 +741,9 @@ pub fn item_from_gvfs_info(path: PathBuf, file_info: gio::FileInfo, sizes: IconS
 
 pub fn item_from_search_item(search_item: SearchItem, sizes: IconSizes) -> Item {
     match search_item {
-        SearchItem::Path(path, name, metadata) => item_from_entry(path, name, metadata, sizes),
+        SearchItem::Path(path, name, metadata) => {
+            item_from_entry_inner(path, name, metadata, sizes, false)
+        }
         SearchItem::Trash(entry, metadata) => item_from_trash_entry(entry, metadata, sizes),
     }
 }
@@ -751,6 +753,16 @@ pub fn item_from_entry(
     name: String,
     metadata: fs::Metadata,
     sizes: IconSizes,
+) -> Item {
+    item_from_entry_inner(path, name, metadata, sizes, true)
+}
+
+fn item_from_entry_inner(
+    path: PathBuf,
+    name: String,
+    metadata: fs::Metadata,
+    sizes: IconSizes,
+    count_children: bool,
 ) -> Item {
     let mut is_desktop = false;
     let mut is_gvfs = false;
@@ -828,7 +840,7 @@ pub fn item_from_entry(
 
     let mut children_opt = None;
     let mut dir_size = DirSize::NotDirectory;
-    if metadata.is_dir() && !remote {
+    if count_children && metadata.is_dir() && !remote {
         dir_size = DirSize::Calculating(Controller::default());
         //TODO: calculate children in the background (and make it cancellable?)
         match fs::read_dir(&path) {
@@ -1327,6 +1339,7 @@ impl EditLocation {
     }
 }
 
+use crate::search::scan_search_cancellable;
 use crate::search::uri_to_path;
 pub use crate::search::{
     SearchDate, SearchFileType, SearchFileTypes, SearchFilter, SearchItem, SearchLocation,
@@ -1349,7 +1362,7 @@ pub enum Location {
     Network(String, String, Option<PathBuf>),
     Path(PathBuf),
     Recents,
-    Search(SearchLocation, String, bool, SearchFilter, Instant),
+    Search(SearchLocation, String, bool, SearchFilter, Instant, bool),
     Trash,
 }
 
@@ -1436,13 +1449,16 @@ impl Location {
                 Self::Desktop(path, display.clone(), *desktop_config)
             }
             Self::Path(..) => Self::Path(path),
-            Self::Search(SearchLocation::Path(_), term, show_hidden, filter, time) => Self::Search(
-                SearchLocation::Path(path),
-                term.clone(),
-                *show_hidden,
-                filter.clone(),
-                *time,
-            ),
+            Self::Search(SearchLocation::Path(_), term, show_hidden, filter, time, immediate) => {
+                Self::Search(
+                    SearchLocation::Path(path),
+                    term.clone(),
+                    *show_hidden,
+                    filter.clone(),
+                    *time,
+                    *immediate,
+                )
+            }
 
             other => other.clone(),
         }
@@ -1648,7 +1664,7 @@ pub enum Message {
     ScrollTab(f32),
     ScrollToFocused,
     SearchContext(Location, SearchContextWrapper),
-    SearchReady(bool),
+    SearchReady(Location, bool),
     SelectAll,
     SelectFirst,
     SelectLast,
@@ -2637,6 +2653,14 @@ struct SearchContext {
     last_modified_opt: Arc<RwLock<Option<SystemTime>>>,
 }
 
+struct SearchCancelOnDrop(Arc<atomic::AtomicBool>);
+
+impl Drop for SearchCancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, atomic::Ordering::Relaxed);
+    }
+}
+
 pub struct SearchContextWrapper(Option<SearchContext>);
 
 impl Clone for SearchContextWrapper {
@@ -3600,7 +3624,7 @@ impl Tab {
                     self.time_formatter = time_formatter(self.config.military_time);
                 }
                 if show_hidden_changed
-                    && let Location::Search(path, term, _, filter, _) = &self.location
+                    && let Location::Search(path, term, _, filter, ..) = &self.location
                 {
                     cd = Some(Location::Search(
                         path.clone(),
@@ -3608,6 +3632,7 @@ impl Tab {
                         self.config.show_hidden,
                         filter.clone(),
                         Instant::now(),
+                        false,
                     ));
                 }
                 // Unhighlight all items when config changes
@@ -4389,50 +4414,60 @@ impl Tab {
                     );
                 }
             }
-            Message::SearchReady(finished) => {
-                let (sort_name, sort_direction, folders_first) = self.sort_options();
-                if let Some(context) = &mut self.search_context {
-                    if let Some(items) = &mut self.items_opt {
-                        if finished || context.ready.swap(false, atomic::Ordering::SeqCst) {
-                            let duration = Instant::now();
-                            while let Ok(search_item) = context.results_rx.try_recv() {
-                                let item = item_from_search_item(search_item, IconSizes::default());
-                                let index = items
-                                    .binary_search_by(|other| {
-                                        Self::compare_items(
-                                            other,
-                                            &item,
-                                            sort_name,
-                                            sort_direction,
-                                            folders_first,
-                                        )
-                                    })
-                                    .unwrap_or_else(|index| index);
+            Message::SearchReady(location, finished) => {
+                if location == self.location {
+                    let (sort_name, sort_direction, folders_first) = self.sort_options();
+                    let mut finished_drained = finished;
+                    if let Some(context) = &mut self.search_context {
+                        if let Some(items) = &mut self.items_opt {
+                            if finished || context.ready.swap(false, atomic::Ordering::SeqCst) {
+                                let started = Instant::now();
+                                while let Ok(search_item) = context.results_rx.try_recv() {
+                                    let item =
+                                        item_from_search_item(search_item, IconSizes::default());
+                                    let index = items
+                                        .binary_search_by(|other| {
+                                            Self::compare_items(
+                                                other,
+                                                &item,
+                                                sort_name,
+                                                sort_direction,
+                                                folders_first,
+                                            )
+                                        })
+                                        .unwrap_or_else(|index| index);
 
-                                if index < MAX_SEARCH_RESULTS {
-                                    items.insert(index, item);
-                                }
-                                // Ensure that updates make it to the GUI in a timely manner
-                                if !finished && duration.elapsed() >= MAX_SEARCH_LATENCY {
-                                    break;
+                                    if index < MAX_SEARCH_RESULTS {
+                                        items.insert(index, item);
+                                    }
+                                    if started.elapsed() >= MAX_SEARCH_LATENCY {
+                                        finished_drained = false;
+                                        break;
+                                    }
                                 }
                             }
+                            if items.len() >= MAX_SEARCH_RESULTS {
+                                items.truncate(MAX_SEARCH_RESULTS);
+                                *context.last_modified_opt.write().unwrap() =
+                                    if sort_name == HeadingOptions::Modified && !sort_direction {
+                                        items.last().and_then(|item| item.metadata.modified())
+                                    } else {
+                                        None
+                                    };
+                            }
+                        } else {
+                            log::warn!("search ready but items array is empty");
                         }
-                        if items.len() >= MAX_SEARCH_RESULTS {
-                            items.truncate(MAX_SEARCH_RESULTS);
-                            *context.last_modified_opt.write().unwrap() =
-                                if sort_name == HeadingOptions::Modified && !sort_direction {
-                                    items.last().and_then(|item| item.metadata.modified())
-                                } else {
-                                    None
-                                };
-                        }
-                    } else {
-                        log::warn!("search ready but items array is empty");
                     }
-                }
-                if finished {
-                    self.search_context = None;
+                    if finished {
+                        if finished_drained {
+                            self.search_context = None;
+                        } else {
+                            commands.push(Command::Iced(
+                                cosmic::Task::done(Message::SearchReady(location, true)).into(),
+                            ));
+                        }
+                    }
                 }
             }
             Message::SelectAll => {
@@ -4595,10 +4630,11 @@ impl Tab {
 
                 self.sort_direction = heading_sort;
                 self.sort_name = heading_option;
-                if let Location::Search(_, _, _, _, start) = &mut self.location {
+                if let Location::Search(_, _, _, _, start, immediate) = &mut self.location {
                     // Restart the bounded top-k scan so discarded results from
                     // the previous ordering cannot bias the new ordering.
                     *start = Instant::now();
+                    *immediate = false;
                     self.items_opt = Some(Vec::new());
                     self.search_context = None;
                 }
@@ -7041,7 +7077,8 @@ impl Tab {
         }
 
         // Load search items incrementally
-        if let Location::Search(search_location, term, show_hidden, filter, start) = &self.location
+        if let Location::Search(search_location, term, show_hidden, filter, start, immediate) =
+            &self.location
         {
             let location = self.location.clone();
             let search_location = search_location.clone();
@@ -7049,6 +7086,7 @@ impl Tab {
             let show_hidden = *show_hidden;
             let filter = filter.clone();
             let start = *start;
+            let immediate = *immediate;
             #[derive(Debug, Hash, Clone)]
             struct Wrapper {
                 location: Location,
@@ -7057,6 +7095,7 @@ impl Tab {
                 show_hidden: bool,
                 filter: SearchFilter,
                 start: Instant,
+                immediate: bool,
             }
 
             subscriptions.push(Subscription::run_with(
@@ -7067,6 +7106,7 @@ impl Tab {
                     show_hidden,
                     filter,
                     start,
+                    immediate,
                 },
                 |wrapper| {
                     let wrapper = wrapper.clone();
@@ -7080,12 +7120,14 @@ impl Tab {
                                 show_hidden,
                                 filter,
                                 start,
+                                immediate,
                             } = wrapper;
-                            //TODO: optimal size?
-                            let (results_tx, results_rx) = mpsc::channel(65536);
+                            let (results_tx, results_rx) = mpsc::channel(256);
 
                             let ready = Arc::new(atomic::AtomicBool::new(false));
                             let last_modified_opt = Arc::new(RwLock::new(None));
+                            let cancelled = Arc::new(atomic::AtomicBool::new(false));
+                            let _cancel_on_drop = SearchCancelOnDrop(cancelled.clone());
                             output
                                 .send(Message::SearchContext(
                                     location.clone(),
@@ -7098,14 +7140,23 @@ impl Tab {
                                 .await
                                 .unwrap();
 
+                            if !immediate {
+                                tokio::time::sleep(
+                                    filter.debounce_duration().saturating_sub(start.elapsed()),
+                                )
+                                .await;
+                            }
+
                             let (watch_tx, mut watch_rx) = tokio::sync::watch::channel(true);
                             {
+                                let scan_cancelled = cancelled.clone();
                                 tokio::task::spawn_blocking(move || {
-                                    scan_search(
+                                    scan_search_cancellable(
                                         &search_location,
                                         &term,
                                         show_hidden,
                                         filter,
+                                        || scan_cancelled.load(atomic::Ordering::Relaxed),
                                         move |search_item| -> bool {
                                             // Don't send if the result is too old
                                             if let Some(last_modified) =
@@ -7146,11 +7197,13 @@ impl Tab {
 
                             while watch_rx.changed().await.is_ok() {
                                 let is_ready = *watch_rx.borrow_and_update();
-                                let _ = output.send(Message::SearchReady(is_ready)).await;
+                                let _ = output
+                                    .send(Message::SearchReady(location.clone(), is_ready))
+                                    .await;
                             }
 
                             // Send final ready
-                            let _ = output.send(Message::SearchReady(true)).await;
+                            let _ = output.send(Message::SearchReady(location, true)).await;
 
                             std::future::pending().await
                         },

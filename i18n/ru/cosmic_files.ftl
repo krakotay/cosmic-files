@@ -12,6 +12,7 @@ undo = Отменить
 today = Сегодня
 add = Добавить
 search-raw-regex = Использовать регулярное выражение
+search-skip-hidden-folders = Пропускать скрытые папки
 search-add-file-type = Добавить тип файла
 search-file-type-placeholder = Поиск типов файлов
 search-file-type-loading = Загрузка типов файлов…

@@ -470,6 +470,7 @@ enum Message {
     SearchActivate,
     SearchClear,
     SearchInput(String),
+    SearchSubmit,
     Surface(cosmic::surface::Action),
     #[allow(clippy::enum_variant_names)]
     TabMessage(tab::Message),
@@ -777,6 +778,14 @@ impl App {
     }
 
     fn search_set(&mut self, term_opt: Option<String>) -> Task<Message> {
+        self.search_set_with_trigger(term_opt, false)
+    }
+
+    fn search_set_with_trigger(
+        &mut self,
+        term_opt: Option<String>,
+        immediate: bool,
+    ) -> Task<Message> {
         let location_opt = match term_opt {
             Some(term) => {
                 let search_location = if let Some(path) = self.tab.location.path_opt() {
@@ -791,9 +800,10 @@ impl App {
 
                 search_location.map(|search_location| {
                     let search_filter = match &self.tab.location {
-                        Location::Search(_, _, _, filter, _) => filter.clone(),
+                        Location::Search(_, _, _, filter, ..) => filter.clone(),
                         _ => tab::SearchFilter {
                             recursive: self.flags.config.search_recursive,
+                            skip_hidden_folders: self.flags.config.search_skip_hidden_folders,
                             text_matching: if self.flags.config.search_content_and_filename {
                                 tab::SearchTextMatching::ContentAndFilename
                             } else {
@@ -809,6 +819,7 @@ impl App {
                             self.tab.config.show_hidden,
                             search_filter,
                             Instant::now(),
+                            immediate,
                         ),
                         true,
                     )
@@ -1252,6 +1263,7 @@ impl Application for App {
                         .id(self.search_id.clone())
                         .on_clear(Message::SearchClear)
                         .on_input(Message::SearchInput)
+                        .on_submit(|_| Message::SearchSubmit)
                         .into(),
                 );
             }
@@ -1762,6 +1774,12 @@ impl Application for App {
             Message::SearchInput(input) => {
                 return self.search_set(Some(input));
             }
+            Message::SearchSubmit => {
+                let Some(term) = self.search_get().map(str::to_owned) else {
+                    return Task::none();
+                };
+                return self.search_set_with_trigger(Some(term), true);
+            }
             Message::TabMessage(tab_message) => {
                 let click_i_opt = match tab_message {
                     tab::Message::Click(click_i_opt) => click_i_opt,
@@ -2059,7 +2077,8 @@ impl Application for App {
                         .width(Length::Fill)
                         .id(self.search_id.clone())
                         .on_clear(Message::SearchClear)
-                        .on_input(Message::SearchInput),
+                        .on_input(Message::SearchInput)
+                        .on_submit(|_| Message::SearchSubmit),
                 )
                 .padding(space_xxs),
             );

@@ -446,7 +446,9 @@ pub enum Message {
     SearchFilterPopup(bool),
     SearchInput(String),
     SearchRecursive(bool),
+    SearchSkipHiddenFolders(bool),
     SearchRawRegex(bool),
+    SearchSubmit,
     SearchTextMatching(SearchTextMatching),
     SetShowDetails(bool),
     SetShowRecents(bool),
@@ -1510,7 +1512,7 @@ impl App {
         selection_paths: Option<Vec<PathBuf>>,
     ) -> Task<Message> {
         if let Location::Search(_, term, ..) = location {
-            self.search_set(entity, Some(term), selection_paths)
+            self.search_set(entity, Some(term), selection_paths, false)
         } else {
             self.rescan_tab(entity, location, selection_paths)
         }
@@ -1613,7 +1615,7 @@ impl App {
         self.tab_model
             .data::<Tab>(entity)
             .and_then(|tab| match &tab.location {
-                Location::Search(_, _, _, filter, _) => Some(filter.clone()),
+                Location::Search(_, _, _, filter, ..) => Some(filter.clone()),
                 _ => None,
             })
             .unwrap_or_default()
@@ -1625,16 +1627,24 @@ impl App {
         };
         let entity = self.tab_model.active();
         if let Some(tab) = self.tab_model.data_mut::<Tab>(entity)
-            && let Location::Search(_, _, _, current_filter, _) = &mut tab.location
+            && let Location::Search(_, _, _, current_filter, ..) = &mut tab.location
         {
             *current_filter = filter;
         }
-        self.search_set(entity, Some(term), None)
+        self.search_set(entity, Some(term), None, false)
     }
 
     fn search_set_active(&mut self, term_opt: Option<String>) -> Task<Message> {
         let entity = self.tab_model.active();
-        self.search_set(entity, term_opt, None)
+        self.search_set(entity, term_opt, None, false)
+    }
+
+    fn search_submit_active(&mut self) -> Task<Message> {
+        let Some(term) = self.search_get().map(str::to_owned) else {
+            return Task::none();
+        };
+        let entity = self.tab_model.active();
+        self.search_set(entity, Some(term), None, true)
     }
 
     fn search_set(
@@ -1642,13 +1652,15 @@ impl App {
         tab: Entity,
         term_opt: Option<String>,
         selection_paths: Option<Vec<PathBuf>>,
+        immediate: bool,
     ) -> Task<Message> {
         let mut title_location_opt = None;
         if let Some(tab) = self.tab_model.data_mut::<Tab>(tab) {
             let search_filter = match &tab.location {
-                Location::Search(_, _, _, filter, _) => filter.clone(),
+                Location::Search(_, _, _, filter, ..) => filter.clone(),
                 _ => SearchFilter {
                     recursive: self.config.search_recursive,
+                    skip_hidden_folders: self.config.search_skip_hidden_folders,
                     raw_regex: self.config.search_raw_regex,
                     custom_file_types: canonical_mime_types(
                         self.config
@@ -1685,6 +1697,7 @@ impl App {
                                 tab.config.show_hidden,
                                 search_filter,
                                 Instant::now(),
+                                immediate,
                             ),
                             true,
                         )
@@ -2629,11 +2642,32 @@ impl App {
         } else {
             recursive_label
         };
+        let skip_hidden_toggle: Element<'_, Message> = if filter.raw_regex {
+            cosmic::iced::widget::toggler(filter.skip_hidden_folders)
+                .size(24)
+                .into()
+        } else {
+            widget::toggler(filter.skip_hidden_folders)
+                .on_toggle(Message::SearchSkipHiddenFolders)
+                .into()
+        };
+        let skip_hidden_label = widget::text::body(fl!("search-skip-hidden-folders"));
+        let skip_hidden_label = if filter.raw_regex {
+            skip_hidden_label.class(theme::Text::Custom(disabled_text_style))
+        } else {
+            skip_hidden_label
+        };
         let search_scope = widget::column::with_children([
             widget::text::heading(fl!("search-scope")).into(),
             widget::row::with_children([
                 recursive_label.width(Length::Fill).into(),
                 recursive_toggle,
+            ])
+            .align_y(Alignment::Center)
+            .into(),
+            widget::row::with_children([
+                skip_hidden_label.width(Length::Fill).into(),
+                skip_hidden_toggle,
             ])
             .align_y(Alignment::Center)
             .into(),
@@ -2690,6 +2724,7 @@ impl App {
             .width(width)
             .id(self.search_id.clone())
             .on_input(Message::SearchInput)
+            .on_submit(|_| Message::SearchSubmit)
             .trailing_icon(widget::row::with_children([clear.into(), popover.into()]).into())
             .into()
     }
@@ -4873,11 +4908,37 @@ impl Application for App {
                 filter.recursive = recursive;
                 return self.search_filter_set_active(filter);
             }
+            Message::SearchSkipHiddenFolders(skip_hidden_folders) => {
+                config_set!(search_skip_hidden_folders, skip_hidden_folders);
+                let show_hidden_changed = !skip_hidden_folders && !self.config.tab.show_hidden;
+                if show_hidden_changed {
+                    let mut config = self.config.tab;
+                    config.show_hidden = true;
+                    config_set!(tab, config);
+
+                    // Let the restarted search see hidden entries immediately.
+                    let entity = self.tab_model.active();
+                    if let Some(tab) = self.tab_model.data_mut::<Tab>(entity) {
+                        tab.config.show_hidden = true;
+                    }
+                }
+                let mut filter = self.search_filter_get();
+                filter.skip_hidden_folders = skip_hidden_folders;
+                let search_task = self.search_filter_set_active(filter);
+                return if show_hidden_changed {
+                    Task::batch([search_task, self.update_config()])
+                } else {
+                    search_task
+                };
+            }
             Message::SearchRawRegex(raw_regex) => {
                 config_set!(search_raw_regex, raw_regex);
                 let mut filter = self.search_filter_get();
                 filter.raw_regex = raw_regex;
                 return self.search_filter_set_active(filter);
+            }
+            Message::SearchSubmit => {
+                return self.search_submit_active();
             }
             Message::SearchTextMatching(text_matching) => {
                 config_set!(

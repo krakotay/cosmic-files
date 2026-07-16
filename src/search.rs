@@ -45,6 +45,7 @@ pub struct SearchFilter {
     pub date: Option<SearchDate>,
     pub text_matching: SearchTextMatching,
     pub recursive: bool,
+    pub skip_hidden_folders: bool,
     pub raw_regex: bool,
 }
 
@@ -56,8 +57,22 @@ impl Default for SearchFilter {
             date: None,
             text_matching: SearchTextMatching::default(),
             recursive: true,
+            skip_hidden_folders: true,
             raw_regex: false,
         }
+    }
+}
+
+impl SearchFilter {
+    pub fn debounce_duration(&self) -> Duration {
+        if self.raw_regex {
+            return Duration::from_secs(3);
+        }
+
+        Duration::from_secs(
+            1 + u64::from(self.recursive) * 2
+                + u64::from(self.text_matching == SearchTextMatching::ContentAndFilename),
+        )
     }
 }
 
@@ -342,6 +357,17 @@ pub fn scan_search<F: Fn(SearchItem) -> bool + Sync>(
     filter: SearchFilter,
     callback: F,
 ) {
+    scan_search_cancellable(location, term, show_hidden, filter, || false, callback);
+}
+
+pub(crate) fn scan_search_cancellable<C: Fn() -> bool + Sync, F: Fn(SearchItem) -> bool + Sync>(
+    location: &SearchLocation,
+    term: &str,
+    show_hidden: bool,
+    filter: SearchFilter,
+    cancelled: C,
+    callback: F,
+) {
     if term.is_empty() {
         return;
     }
@@ -353,28 +379,39 @@ pub fn scan_search<F: Fn(SearchItem) -> bool + Sync>(
         }
     };
     match location {
-        SearchLocation::Path(root) => scan_path(root, show_hidden, &filter, &pattern, callback),
-        SearchLocation::Recents => scan_recents(&filter, &pattern, callback),
-        SearchLocation::Trash => Trash::scan_search(callback, &pattern.text),
+        SearchLocation::Path(root) => {
+            scan_path(root, show_hidden, &filter, &pattern, &cancelled, callback)
+        }
+        SearchLocation::Recents => scan_recents(&filter, &pattern, &cancelled, callback),
+        SearchLocation::Trash => {
+            Trash::scan_search(|item| !cancelled() && callback(item), &pattern.text)
+        }
     }
 }
 
-fn scan_path<F: Fn(SearchItem) -> bool + Sync>(
+fn scan_path<C: Fn() -> bool + Sync, F: Fn(SearchItem) -> bool + Sync>(
     root: &Path,
     show_hidden: bool,
     filter: &SearchFilter,
     pattern: &SearchPattern,
+    cancelled: &C,
     callback: F,
 ) {
     let recursive = filter.recursive && !filter.raw_regex;
+    #[cfg(unix)]
+    let skip_hidden_folders = filter.skip_hidden_folders && !filter.raw_regex;
     ignore::WalkBuilder::new(root)
         .standard_filters(false)
         .hidden(!show_hidden)
         .max_depth((!recursive).then_some(1))
         .same_file_system(true)
+        .threads(1)
         .build_parallel()
         .run(|| {
             Box::new(|entry_res| {
+                if cancelled() {
+                    return ignore::WalkState::Quit;
+                }
                 let Ok(entry) = entry_res else {
                     return ignore::WalkState::Skip;
                 };
@@ -389,6 +426,13 @@ fn scan_path<F: Fn(SearchItem) -> bool + Sync>(
                         return ignore::WalkState::Continue;
                     }
                 };
+                #[cfg(unix)]
+                if skip_hidden_folders
+                    && metadata.is_dir()
+                    && entry.file_name().as_bytes().starts_with(b".")
+                {
+                    return ignore::WalkState::Skip;
+                }
                 if matches_filter(path, entry.file_name(), &metadata, pattern, filter)
                     && !callback(SearchItem::Path(
                         path.to_path_buf(),
@@ -403,9 +447,10 @@ fn scan_path<F: Fn(SearchItem) -> bool + Sync>(
         });
 }
 
-fn scan_recents<F: Fn(SearchItem) -> bool + Sync>(
+fn scan_recents<C: Fn() -> bool + Sync, F: Fn(SearchItem) -> bool + Sync>(
     filter: &SearchFilter,
     pattern: &SearchPattern,
+    cancelled: &C,
     callback: F,
 ) {
     let files = match recently_used_xbel::parse_file() {
@@ -416,6 +461,9 @@ fn scan_recents<F: Fn(SearchItem) -> bool + Sync>(
         }
     };
     for bookmark in files.bookmarks {
+        if cancelled() {
+            break;
+        }
         let Some(path) = uri_to_path(bookmark.href).filter(|p| p.exists()) else {
             continue;
         };
@@ -579,6 +627,72 @@ mod tests {
     }
 
     #[test]
+    fn debounce_duration_tracks_search_cost() {
+        let filename_only = SearchFilter {
+            recursive: false,
+            text_matching: SearchTextMatching::FilenameOnly,
+            ..SearchFilter::default()
+        };
+        assert_eq!(filename_only.debounce_duration(), Duration::from_secs(1));
+        assert_eq!(
+            SearchFilter {
+                text_matching: SearchTextMatching::ContentAndFilename,
+                ..filename_only.clone()
+            }
+            .debounce_duration(),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            SearchFilter {
+                recursive: true,
+                ..filename_only.clone()
+            }
+            .debounce_duration(),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            SearchFilter {
+                recursive: true,
+                text_matching: SearchTextMatching::ContentAndFilename,
+                ..filename_only.clone()
+            }
+            .debounce_duration(),
+            Duration::from_secs(4)
+        );
+        assert_eq!(
+            SearchFilter {
+                raw_regex: true,
+                recursive: true,
+                text_matching: SearchTextMatching::ContentAndFilename,
+                ..filename_only
+            }
+            .debounce_duration(),
+            Duration::from_secs(3)
+        );
+    }
+
+    #[test]
+    fn cancelled_path_search_stops_before_traversal() {
+        let temp = tempfile::TempDir::new().unwrap();
+        fs::write(temp.path().join("match.txt"), b"").unwrap();
+        let found = std::sync::atomic::AtomicUsize::new(0);
+
+        scan_search_cancellable(
+            &SearchLocation::Path(temp.path().to_path_buf()),
+            "*",
+            true,
+            SearchFilter::default(),
+            || true,
+            |_| {
+                found.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                true
+            },
+        );
+
+        assert_eq!(found.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[test]
     fn path_search_does_not_return_its_root() {
         let temp = tempfile::TempDir::new().unwrap();
         fs::write(temp.path().join("child.txt"), b"").unwrap();
@@ -598,6 +712,72 @@ mod tests {
         let found = found.into_inner().unwrap();
         assert_eq!(found, vec![temp.path().join("child.txt")]);
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn hidden_folders_can_be_skipped_independently_of_hidden_files() {
+        let temp = tempfile::TempDir::new().unwrap();
+        fs::create_dir(temp.path().join(".hidden-folder")).unwrap();
+        fs::write(temp.path().join(".hidden-folder/nested.txt"), b"").unwrap();
+        fs::create_dir(temp.path().join("visible-folder")).unwrap();
+        fs::write(temp.path().join("visible-folder/nested.txt"), b"").unwrap();
+        fs::write(temp.path().join(".hidden-file.txt"), b"").unwrap();
+
+        let search = |filter| {
+            let found = std::sync::Mutex::new(Vec::new());
+            scan_search(
+                &SearchLocation::Path(temp.path().to_path_buf()),
+                "*",
+                true,
+                filter,
+                |item| {
+                    if let SearchItem::Path(path, ..) = item {
+                        found.lock().unwrap().push(path);
+                    }
+                    true
+                },
+            );
+            found.into_inner().unwrap()
+        };
+
+        let skipped = search(SearchFilter::default());
+        assert!(skipped.contains(&temp.path().join(".hidden-file.txt")));
+        assert!(skipped.contains(&temp.path().join("visible-folder/nested.txt")));
+        assert!(!skipped.contains(&temp.path().join(".hidden-folder")));
+        assert!(!skipped.contains(&temp.path().join(".hidden-folder/nested.txt")));
+
+        let included = search(SearchFilter {
+            skip_hidden_folders: false,
+            ..SearchFilter::default()
+        });
+        assert!(included.contains(&temp.path().join(".hidden-folder")));
+        assert!(included.contains(&temp.path().join(".hidden-folder/nested.txt")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn raw_regex_deactivates_hidden_folder_filter() {
+        let temp = tempfile::TempDir::new().unwrap();
+        fs::create_dir(temp.path().join(".hidden-folder")).unwrap();
+        let found = std::sync::atomic::AtomicUsize::new(0);
+
+        scan_search(
+            &SearchLocation::Path(temp.path().to_path_buf()),
+            r"^\.hidden-folder$",
+            true,
+            SearchFilter {
+                raw_regex: true,
+                ..SearchFilter::default()
+            },
+            |_| {
+                found.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                true
+            },
+        );
+
+        assert_eq!(found.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
     #[test]
     fn raw_uses_regex() {
         let p = SearchPattern::compile(r"^file-[0-9]+\.rs$", true).unwrap();

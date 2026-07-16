@@ -38,6 +38,7 @@ filetype-binary = Binary
 search-current-folder = Search current folder
 search-scope = Search Scope
 search-subfolders = Search subfolders
+search-skip-hidden-folders = Skip hidden folders
 search-raw-regex = Use raw regex
 search-file-types = File Types
 search-type-text = Text
